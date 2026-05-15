@@ -1,0 +1,162 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import { Message } from "../../components/common/Message";
+import { REQUESTS_PAGE_SIZE } from "../../config/appConfig";
+import { STORAGE_KEYS } from "../../config/storageKeys";
+import { apiRequest, logoutAdmin, savedSession } from "../../services/api";
+import { exportRequestsWorkbook } from "../../utils/excel";
+import { isToday } from "../../utils/formatters";
+import { AdminSidebar } from "./AdminSidebar";
+import { AuditPanel } from "./AuditPanel";
+import { Dashboard } from "./Dashboard";
+import { FinancePanel } from "./FinancePanel";
+import { FlightsPanel } from "./FlightsPanel";
+import { NotificationsPanel } from "./NotificationsPanel";
+import { RequestsPanel } from "./RequestsPanel";
+
+export function AdminPage({ onBack }) {
+  const [activeTab, setActiveTab] = useState(
+    window.localStorage.getItem(STORAGE_KEYS.activeAdminTab) || "dashboard",
+  );
+  const [requests, setRequests] = useState([]);
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [dateFilter, setDateFilter] = useState("all");
+  const [page, setPage] = useState(1);
+  const [message, setMessage] = useState(null);
+
+  const loadData = useCallback(async () => {
+    try {
+      const [requestsPayload, auditPayload] = await Promise.all([
+        apiRequest("/solicitacoes?sort=createdAt&order=desc"),
+        apiRequest("/alteracoes?sort=dataAlteracao&order=desc"),
+      ]);
+      setRequests(requestsPayload.data || []);
+      setAuditLogs(auditPayload.data || []);
+      setMessage(null);
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error.message || "Erro ao carregar painel.",
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(STORAGE_KEYS.activeAdminTab, activeTab);
+  }, [activeTab]);
+
+  useEffect(() => {
+    void Promise.resolve().then(loadData);
+  }, [loadData]);
+
+  const filteredRequests = useMemo(() => {
+    let rows = search
+      ? requests.filter((item) =>
+          JSON.stringify(item).toLowerCase().includes(search.toLowerCase()),
+        )
+      : requests;
+    if (statusFilter !== "all") {
+      rows = rows.filter((item) => (item.status || "Recebida") === statusFilter);
+    }
+    if (dateFilter === "today") {
+      rows = rows.filter((item) => isToday(item.createdAtIso || item.createdAt));
+    }
+    return rows;
+  }, [requests, search, statusFilter, dateFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredRequests.length / REQUESTS_PAGE_SIZE));
+  const pageRows = filteredRequests.slice(
+    (page - 1) * REQUESTS_PAGE_SIZE,
+    page * REQUESTS_PAGE_SIZE,
+  );
+
+  function setTab(tab) {
+    setActiveTab(tab);
+    setPage(1);
+  }
+
+  function exportWorkbook() {
+    const rows = filteredRequests.length ? filteredRequests : requests;
+    exportRequestsWorkbook(rows);
+  }
+
+  async function deleteRequest(id) {
+    if (!confirm("Tem certeza que deseja apagar este registro?")) return;
+    await apiRequest(`/solicitacoes/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await loadData();
+  }
+
+  async function logout() {
+    await logoutAdmin();
+    onBack();
+  }
+
+  return (
+    <section className="admin-dashboard">
+      <div className="dashboard-shell">
+        <AdminSidebar
+          activeTab={activeTab}
+          onTab={setTab}
+          onExport={exportWorkbook}
+          onLogout={logout}
+        />
+        <div className="dashboard-content">
+          <div className="dashboard-header">
+            <div className="dashboard-title-block">
+              <span className="section-kicker">Visao administrativa</span>
+              <h2>Painel Administrativo</h2>
+              <p className="subtitle">
+                Operacao consolidada, filtros vivos e documentos prontos para
+                auditoria, financeiro e logistica.
+              </p>
+            </div>
+            <div className="dashboard-header-meta">
+              <div className="admin-session-card">
+                <span className="status-dot" />
+                <div>
+                  <small>Usuario ativo</small>
+                  <strong>{savedSession().login || "admin"}</strong>
+                </div>
+              </div>
+              <div className="dashboard-actions">
+                <button type="button" onClick={loadData}>
+                  Atualizar
+                </button>
+                <button type="button" onClick={exportWorkbook}>
+                  Exportar XLSM
+                </button>
+                <button type="button" className="btn-ghost" onClick={logout}>
+                  Sair
+                </button>
+              </div>
+            </div>
+          </div>
+          <Message message={message} />
+          {activeTab === "dashboard" && <Dashboard requests={requests} />}
+          {activeTab === "solicitacoes" && (
+            <RequestsPanel
+              search={search}
+              setSearch={setSearch}
+              statusFilter={statusFilter}
+              setStatusFilter={setStatusFilter}
+              dateFilter={dateFilter}
+              setDateFilter={setDateFilter}
+              rows={pageRows}
+              total={filteredRequests.length}
+              page={page}
+              totalPages={totalPages}
+              setPage={setPage}
+              onDelete={deleteRequest}
+            />
+          )}
+          {activeTab === "alteracoes" && <AuditPanel logs={auditLogs} />}
+          {activeTab === "notificacoes" && <NotificationsPanel logs={auditLogs} />}
+          {activeTab === "financeiro" && <FinancePanel requests={requests} />}
+          {activeTab === "voos" && <FlightsPanel requests={requests} />}
+        </div>
+      </div>
+    </section>
+  );
+}

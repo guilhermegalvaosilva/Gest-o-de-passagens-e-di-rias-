@@ -1,0 +1,66 @@
+import { useState } from "react";
+
+import { Message } from "../../components/common/Message";
+import { loginAdmin } from "../../services/api";
+
+export function LoginPage({ onBack, onLogin }) {
+  const [login, setLogin] = useState("");
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState(null);
+
+  async function submit(event) {
+    event.preventDefault();
+    try {
+      await loginAdmin(login, password);
+      onLogin();
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error.message || "Login ou senha invalidos.",
+      });
+    }
+  }
+
+  return (
+    <section className="card login-card">
+      <div className="section-heading compact-heading">
+        <div>
+          <span className="section-kicker">Acesso restrito</span>
+          <h2>Login Administrativo</h2>
+          <p className="subtitle">
+            Use um usuario administrativo para acessar relatorios, alteracoes,
+            exclusoes e exportacoes.
+          </p>
+        </div>
+        <button className="btn btn-ghost" type="button" onClick={onBack}>
+          Voltar
+        </button>
+      </div>
+      <form className="auth-panel simple-login" onSubmit={submit}>
+        <div className="form-group full">
+          <label>Login</label>
+          <input
+            value={login}
+            onChange={(event) => setLogin(event.target.value)}
+            autoComplete="username"
+            required
+          />
+        </div>
+        <div className="form-group full">
+          <label>Senha</label>
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete="current-password"
+            required
+          />
+        </div>
+        <Message message={message} />
+        <div className="actions">
+          <button type="submit">Entrar no painel</button>
+        </div>
+      </form>
+    </section>
+  );
+}

@@ -1,0 +1,25 @@
+.login-card {
+  max-width: 680px;
+  margin: 0 auto;
+}
+
+.auth-panel {
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.login-card .actions {
+  justify-content: flex-end;
+}
+
+@media (max-width: 900px) {
+  .login-card .actions {
+    justify-content: stretch;
+  }
+
+  .login-card .actions > * {
+    width: 100%;
+  }
+}
