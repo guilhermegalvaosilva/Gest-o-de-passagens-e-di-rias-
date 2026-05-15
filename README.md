@@ -1,5 +1,25 @@
 # React + Vite
 
+## Rodar com Docker
+
+```bash
+docker compose up --build
+```
+
+Acesse:
+
+```text
+http://localhost:3002
+```
+
+Login inicial:
+
+```text
+admin / 123456
+```
+
+Os dados do backend ficam persistidos no volume `nugb-gereb-data`.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

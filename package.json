@@ -9,6 +9,8 @@
     "dev:api": "node server.js",
     "start": "node server.js",
     "build": "vite build",
+    "docker:build": "docker build -t nugb-gereb-form .",
+    "docker:run": "docker run --name nugb-gereb-form -p 3002:3002 -v nugb-gereb-data:/app/data nugb-gereb-form",
     "lint": "eslint .",
     "preview": "vite preview"
   },
