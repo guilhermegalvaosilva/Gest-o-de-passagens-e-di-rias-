@@ -25,7 +25,17 @@ function App() {
   useEffect(() => {
     removeStorage(STORAGE_KEYS.activePage);
     apiRequest("/health")
-      .then(() => setStorageMode("Backend conectado"))
+      .then((payload) => {
+        if (payload.database === "firestore") {
+          setStorageMode("Firebase conectado");
+          return;
+        }
+        if (payload.database === "local-json") {
+          setStorageMode("Banco local conectado");
+          return;
+        }
+        setStorageMode("Backend conectado");
+      })
       .catch(() => setStorageMode("Backend indisponivel"));
   }, []);
 

@@ -19,12 +19,19 @@ const DIST_DIR = path.join(ROOT_DIR, "dist");
 const PUBLIC_DIR = path.join(ROOT_DIR, "public");
 const DATA_DIR = path.join(ROOT_DIR, "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
+const FIREBASE_CONFIG_PATH =
+  process.env.FIREBASE_CONFIG_PATH ||
+  path.join(ROOT_DIR, "js", "firebase-config.js");
+const FIRESTORE_DATABASE_ID = process.env.FIRESTORE_DATABASE_ID || "(default)";
+const DATA_COLLECTIONS = ["solicitacoes", "alteracoes", "admins", "sessions"];
 const SESSION_DURATION_MS = 8 * 60 * 60 * 1000;
 const DEFAULT_ADMIN_PASSWORD = "123456";
 const MAX_BODY_SIZE_BYTES = 1024 * 1024;
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_ATTEMPTS = 12;
+const FIRESTORE_TIMEOUT_MS = 8000;
 const loginAttempts = new Map();
+let dataStoreState = null;
 
 const REQUEST_STATUS_OPTIONS = [
   "Recebida",
@@ -206,37 +213,260 @@ function defaultDb() {
   };
 }
 
-async function ensureDb() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    await fs.access(DB_PATH);
-  } catch {
-    await fs.writeFile(DB_PATH, JSON.stringify(defaultDb(), null, 2));
-  }
+function parseFirebaseConfigSource(source) {
+  const match = source.match(/FIREBASE_CONFIG\s*=\s*({[\s\S]*?});?/);
+  if (!match) return null;
+
+  const jsonText = match[1]
+    .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')
+    .replace(/,\s*([}\]])/g, "$1");
+  return JSON.parse(jsonText);
 }
 
-async function readDb() {
-  await ensureDb();
-  const raw = await fs.readFile(DB_PATH, "utf8");
-  let db;
-  try {
-    db = JSON.parse(raw || "{}");
-  } catch {
-    const backupPath = `${DB_PATH}.corrompido-${Date.now()}.bak`;
-    await fs.writeFile(backupPath, raw);
-    db = defaultDb();
-    await writeDb(db);
-  }
-  db.solicitacoes = Array.isArray(db.solicitacoes) ? db.solicitacoes : [];
-  db.alteracoes = Array.isArray(db.alteracoes) ? db.alteracoes : [];
-  db.admins =
-    Array.isArray(db.admins) && db.admins.length
-      ? db.admins
-      : [createAdminRecord("admin", DEFAULT_ADMIN_PASSWORD, "padrao")];
-  db.sessions = Array.isArray(db.sessions) ? db.sessions : [];
+async function loadFirebaseConfig() {
+  const config = {
+    enabled: process.env.FIREBASE_ENABLED
+      ? process.env.FIREBASE_ENABLED !== "false"
+      : undefined,
+    apiKey: process.env.FIREBASE_API_KEY,
+    authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+    messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+    appId: process.env.FIREBASE_APP_ID,
+    measurementId: process.env.FIREBASE_MEASUREMENT_ID,
+  };
 
+  try {
+    const source = await fs.readFile(FIREBASE_CONFIG_PATH, "utf8");
+    Object.assign(config, parseFirebaseConfigSource(source) || {}, {
+      ...Object.fromEntries(
+        Object.entries(config).filter(([, value]) => value !== undefined),
+      ),
+    });
+  } catch {
+    // Environment variables can still provide the Firebase connection in deploys.
+  }
+
+  return config;
+}
+
+function firebaseConfigReady(config) {
+  if (!config || config.enabled === false) return false;
+  return ["apiKey", "projectId"].every((key) => {
+    const value = String(config[key] || "");
+    return value && !value.startsWith("COLE_") && !value.startsWith("SEU_");
+  });
+}
+
+function firestoreDocumentPath(...segments) {
+  return segments.map((segment) => encodeURIComponent(String(segment))).join("/");
+}
+
+function firestoreBaseUrl(config) {
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    config.projectId,
+  )}/databases/${encodeURIComponent(FIRESTORE_DATABASE_ID)}/documents`;
+}
+
+async function firestoreRequest(config, method, documentPath = "", body, params = {}) {
+  const query = new URLSearchParams({
+    key: config.apiKey,
+    ...params,
+  });
+  const url = `${firestoreBaseUrl(config)}${
+    documentPath ? `/${documentPath}` : ""
+  }?${query.toString()}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FIRESTORE_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(`Firestore sem resposta em ${FIRESTORE_TIMEOUT_MS / 1000}s.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message = payload?.error?.message || `Firestore retornou HTTP ${response.status}.`;
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+
+  return payload;
+}
+
+function toFirestoreFields(data) {
+  return Object.fromEntries(
+    Object.entries(data || {}).map(([key, value]) => [key, toFirestoreValue(value)]),
+  );
+}
+
+function toFirestoreValue(value) {
+  if (value === null || value === undefined) return { nullValue: null };
+  if (Array.isArray(value)) {
+    return {
+      arrayValue: {
+        ...(value.length ? { values: value.map(toFirestoreValue) } : {}),
+      },
+    };
+  }
+
+  if (typeof value === "boolean") return { booleanValue: value };
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? { integerValue: String(value) }
+      : { doubleValue: value };
+  }
+  if (typeof value === "object") {
+    return { mapValue: { fields: toFirestoreFields(value) } };
+  }
+  return { stringValue: String(value) };
+}
+
+function fromFirestoreFields(fields = {}) {
+  return Object.fromEntries(
+    Object.entries(fields).map(([key, value]) => [key, fromFirestoreValue(value)]),
+  );
+}
+
+function fromFirestoreValue(value = {}) {
+  if (Object.hasOwn(value, "nullValue")) return null;
+  if (Object.hasOwn(value, "booleanValue")) return value.booleanValue;
+  if (Object.hasOwn(value, "integerValue")) return Number(value.integerValue);
+  if (Object.hasOwn(value, "doubleValue")) return Number(value.doubleValue);
+  if (Object.hasOwn(value, "timestampValue")) return value.timestampValue;
+  if (Object.hasOwn(value, "arrayValue")) {
+    return (value.arrayValue.values || []).map(fromFirestoreValue);
+  }
+  if (Object.hasOwn(value, "mapValue")) {
+    return fromFirestoreFields(value.mapValue.fields || {});
+  }
+  return value.stringValue || "";
+}
+
+function documentIdForRow(collection, row) {
+  if (row.id) return String(row.id);
+  if (collection === "sessions" && row.token) return String(row.token);
+  if (collection === "admins" && row.login) return String(row.login);
+  return randomUUID();
+}
+
+function createFirestoreStore(config) {
+  async function readCollection(collection) {
+    const rows = [];
+    let pageToken = "";
+    do {
+      const payload = await firestoreRequest(
+        config,
+        "GET",
+        firestoreDocumentPath(collection),
+        null,
+        {
+          pageSize: "1000",
+          ...(pageToken ? { pageToken } : {}),
+        },
+      );
+      rows.push(
+        ...(payload.documents || []).map((document) => {
+          const id = document.name.split("/").pop();
+          return { id, ...fromFirestoreFields(document.fields || {}) };
+        }),
+      );
+      pageToken = payload.nextPageToken || "";
+    } while (pageToken);
+    return rows;
+  }
+
+  async function writeDocument(collection, row) {
+    const id = documentIdForRow(collection, row);
+    await firestoreRequest(
+      config,
+      "PATCH",
+      firestoreDocumentPath(collection, id),
+      { fields: toFirestoreFields({ ...row, id }) },
+    );
+  }
+
+  async function deleteDocument(collection, id) {
+    try {
+      await firestoreRequest(
+        config,
+        "DELETE",
+        firestoreDocumentPath(collection, id),
+      );
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+  }
+
+  return {
+    mode: "firestore",
+    projectId: config.projectId,
+    async ping() {
+      await readCollection("admins");
+    },
+    async read() {
+      const entries = await Promise.all(
+        DATA_COLLECTIONS.map(async (collection) => [
+          collection,
+          await readCollection(collection),
+        ]),
+      );
+      return Object.fromEntries(entries);
+    },
+    async write(db) {
+      for (const collection of DATA_COLLECTIONS) {
+        const nextRows = Array.isArray(db[collection]) ? db[collection] : [];
+        const nextIds = new Set(
+          nextRows.map((row) => documentIdForRow(collection, row)),
+        );
+        const currentRows = await readCollection(collection);
+        await Promise.all(
+          currentRows
+            .filter((row) => !nextIds.has(documentIdForRow(collection, row)))
+            .map((row) => deleteDocument(collection, documentIdForRow(collection, row))),
+        );
+        await Promise.all(nextRows.map((row) => writeDocument(collection, row)));
+      }
+    },
+  };
+}
+
+function normalizeDb(db) {
   let changed = false;
-  db.admins = db.admins.map((admin) => {
+  const next = db && typeof db === "object" ? { ...db } : defaultDb();
+
+  if (!Array.isArray(next.solicitacoes)) {
+    next.solicitacoes = [];
+    changed = true;
+  }
+  if (!Array.isArray(next.alteracoes)) {
+    next.alteracoes = [];
+    changed = true;
+  }
+  if (!Array.isArray(next.admins) || !next.admins.length) {
+    next.admins = [createAdminRecord("admin", DEFAULT_ADMIN_PASSWORD, "padrao")];
+    changed = true;
+  }
+  if (!Array.isArray(next.sessions)) {
+    next.sessions = [];
+    changed = true;
+  }
+
+  next.admins = next.admins.map((admin) => {
     if (admin.passwordHash) return admin;
     changed = true;
     return createAdminRecord(
@@ -245,20 +475,98 @@ async function readDb() {
       admin.createdAt || new Date().toLocaleString("pt-BR"),
     );
   });
-  db.sessions = db.sessions.filter((session) => {
+  next.sessions = next.sessions.filter((session) => {
     const valid = Number(session.expiresAt || 0) > Date.now();
     if (!valid) changed = true;
     return valid;
   });
-  if (changed) await writeDb(db);
+
+  return { db: next, changed };
+}
+
+async function ensureLocalDb() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  try {
+    await fs.access(DB_PATH);
+  } catch {
+    await fs.writeFile(DB_PATH, JSON.stringify(defaultDb(), null, 2));
+  }
+}
+
+async function readLocalDb() {
+  await ensureLocalDb();
+  const raw = await fs.readFile(DB_PATH, "utf8");
+  try {
+    return JSON.parse(raw || "{}");
+  } catch {
+    const backupPath = `${DB_PATH}.corrompido-${Date.now()}.bak`;
+    await fs.writeFile(backupPath, raw);
+    const db = defaultDb();
+    await writeLocalDb(db);
+    return db;
+  }
+}
+
+async function writeLocalDb(db) {
+  await ensureLocalDb();
+  const tempPath = `${DB_PATH}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(db, null, 2));
+  await fs.rename(tempPath, DB_PATH);
+}
+
+const localJsonStore = {
+  mode: "local-json",
+  async read() {
+    return readLocalDb();
+  },
+  async write(db) {
+    await writeLocalDb(db);
+  },
+};
+
+async function getDataStore() {
+  if (dataStoreState) return dataStoreState.store;
+
+  const firebaseConfig = await loadFirebaseConfig();
+  if (firebaseConfigReady(firebaseConfig)) {
+    const firestoreStore = createFirestoreStore(firebaseConfig);
+    try {
+      await firestoreStore.ping();
+      dataStoreState = { store: firestoreStore, warning: "" };
+      console.log(`Banco Firebase Firestore conectado: ${firebaseConfig.projectId}`);
+      return firestoreStore;
+    } catch (error) {
+      if (process.env.FIREBASE_LOCAL_FALLBACK === "false") throw error;
+      const warning = `Firebase indisponivel (${error.message}). Usando db.json local.`;
+      console.error(warning);
+      dataStoreState = { store: localJsonStore, warning };
+      return localJsonStore;
+    }
+  }
+
+  dataStoreState = { store: localJsonStore, warning: "" };
+  return localJsonStore;
+}
+
+function dataStoreInfo() {
+  const store = dataStoreState?.store;
+  return {
+    database: store?.mode || "inicializando",
+    projectId: store?.projectId || "",
+    warning: dataStoreState?.warning || "",
+  };
+}
+
+async function readDb() {
+  const store = await getDataStore();
+  const { db, changed } = normalizeDb(await store.read());
+  if (changed) await store.write(db);
   return db;
 }
 
 async function writeDb(db) {
-  await ensureDb();
-  const tempPath = `${DB_PATH}.tmp`;
-  await fs.writeFile(tempPath, JSON.stringify(db, null, 2));
-  await fs.rename(tempPath, DB_PATH);
+  const store = await getDataStore();
+  await store.write(normalizeDb(db).db);
 }
 
 function publicAdmin(admin) {
@@ -524,7 +832,8 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/health") {
-    sendJson(res, 200, { ok: true, mode: "backend-api" });
+    await getDataStore();
+    sendJson(res, 200, { ok: true, mode: "backend-api", ...dataStoreInfo() });
     return;
   }
 

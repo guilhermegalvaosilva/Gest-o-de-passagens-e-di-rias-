@@ -22,6 +22,35 @@ Login inicial:
 admin / 123456
 ```
 
+## Banco de dados
+
+O backend tenta conectar ao Firebase Firestore usando `js/firebase-config.js`.
+Se o Firestore estiver acessivel e com regras permitindo leitura/gravacao, as
+colecoes usadas sao:
+
+```text
+solicitacoes
+alteracoes
+admins
+sessions
+```
+
+Se a conexao com o Firebase falhar, o backend usa `data/db.json` como fallback
+local. Para impedir esse fallback em producao, configure:
+
+```text
+FIREBASE_LOCAL_FALLBACK=false
+```
+
+Tambem e possivel sobrescrever a configuracao por variaveis de ambiente:
+
+```text
+FIREBASE_API_KEY
+FIREBASE_PROJECT_ID
+FIREBASE_AUTH_DOMAIN
+FIREBASE_APP_ID
+```
+
 ## Desenvolvimento
 
 Para mexer no frontend com recarregamento automatico, rode dois terminais:
